@@ -1604,10 +1604,26 @@ class DanthermDevice(DanthermModbus):
                     f"{mode_name}_operation_selection", None
                 )
 
+                # For boost mode, ensure we capture the true previous operation
+                # If current_operation matches a boost operation, try to find the real previous state
+                previous_operation = current_operation
+                if (mode_name == "boost" and 
+                    current_operation in [STATE_LEVEL_2, STATE_LEVEL_3, STATE_LEVEL_4]):
+                    # Check if there's already a boost event in the stack from a previous trigger
+                    existing_event = self._lookup_event(mode_name)
+                    if existing_event:
+                        # Use the previous operation from the existing event
+                        previous_operation = existing_event["previous"]
+                    else:
+                        # Try to determine the real previous state by checking if we're in week program mode
+                        if (self._active_unit_mode is not None and
+                            self._active_unit_mode & ActiveUnitMode.WeekProgram == ActiveUnitMode.WeekProgram):
+                            previous_operation = STATE_WEEKPROGRAM
+
                 # Push the new event to the stack
                 if self._push_event(
                     mode_name,
-                    current_operation,
+                    previous_operation,
                     possible_target,
                     timeout=mode_data["timeout"],
                 ):
