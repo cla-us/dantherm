@@ -1604,16 +1604,22 @@ class DanthermDevice(DanthermModbus):
                     f"{mode_name}_operation_selection", None
                 )
 
-                # For boost mode, ensure we capture the true previous operation
-                # If current_operation matches a boost operation, try to find the real previous state
+                # Ensure we capture the true previous operation for adaptive modes
+                # If current_operation matches the target operation, the hardware may have already switched
                 previous_operation = current_operation
-                if (mode_name == "boost" and 
-                    current_operation in [STATE_LEVEL_2, STATE_LEVEL_3, STATE_LEVEL_4]):
-                    # Check if there's already a boost event in the stack from a previous trigger
+                if (mode_name in ["boost", "eco"] and 
+                    ((mode_name == "boost" and current_operation in [STATE_LEVEL_2, STATE_LEVEL_3, STATE_LEVEL_4]) or
+                     (mode_name == "eco" and current_operation in [STATE_STANDBY, STATE_LEVEL_1, STATE_LEVEL_2]))):
+                    # Check if there's already an event in the stack from a previous trigger
                     existing_event = self._lookup_event(mode_name)
                     if existing_event:
                         # Use the previous operation from the existing event
                         previous_operation = existing_event["previous"]
+                    elif self._last_current_operation and self._last_current_operation != current_operation:
+                        # Use the last known operation before hardware switched to the triggered mode
+                        previous_operation = self._last_current_operation
+                        _LOGGER.debug("Using last known operation '%s' as previous for %s mode", 
+                                    previous_operation, mode_name)
                     else:
                         # Try to determine the real previous state by checking if we're in week program mode
                         if (self._active_unit_mode is not None and
