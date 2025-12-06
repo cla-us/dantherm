@@ -523,10 +523,6 @@ class DanthermAdaptiveManager:
         """Process expired events."""
 
         while (event := self.expired_event()) is not None:
-            # Check if operation mode change timeout has passed
-            if ha_now() < self._operation_change_timeout:
-                return
-
             # Remove event from stack
             target_operation = self.remove_event(event)
             if target_operation:

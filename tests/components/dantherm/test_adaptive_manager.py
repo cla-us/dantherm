@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from config.custom_components.dantherm.adaptive_manager import (
     AdaptiveEventStack,
     DanthermAdaptiveManager,
 )
+from config.custom_components.dantherm.device_map import (
+    CONF_BOOST_MODE_TRIGGER,
+    STATE_WEEKPROGRAM,
+)
+from homeassistant.const import STATE_OFF, STATE_ON
 import pytest
 
 from homeassistant.core import HomeAssistant
@@ -267,3 +272,181 @@ class TestEventStackIntegration:
         ):
             await adaptive_manager.async_set_up_adaptive_manager()
             mock_cleanup.assert_called_once()
+
+
+class TestBoostModeTimeout:
+    """Test boost mode timeout behavior."""
+
+    def setup_mock_manager(self):
+        """Create a mock device manager with necessary methods."""
+        # Create mock hass and config entry
+        mock_hass = MagicMock()
+        mock_config_entry = MagicMock()
+        mock_config_entry.entry_id = "test_entry"
+        mock_config_entry.options = {}
+        
+        # Create manager
+        manager = DanthermAdaptiveManager(mock_hass, mock_config_entry)
+        
+        # Mock the required mixin methods
+        manager.get_device_id = MagicMock(return_value="test_device")
+        manager.get_entity_state_from_coordinator = MagicMock(
+            side_effect=lambda key, default=None: {
+                "boost_mode": True,
+                "boost_mode_timeout": 5,  # 5 minutes timeout
+            }.get(key, default)
+        )
+        manager.get_current_operation = MagicMock(
+            return_value=STATE_WEEKPROGRAM
+        )
+        manager.set_operation_selection = AsyncMock()
+        manager.get_device_entities = MagicMock(return_value=[])
+
+        # Set up the mock hass states
+        mock_state = MagicMock()
+        mock_state.state = STATE_OFF
+        mock_hass.states.get = MagicMock(return_value=mock_state)
+
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_boost_mode_timeout_reverts_to_week_program(self):
+        """Test that boost mode properly reverts to week program after timeout.
+
+        This test reproduces the issue where boost mode would "stick" instead of
+        reverting to the configured week program after the timeout period.
+        """
+        manager = self.setup_mock_manager()
+
+        # Set up trigger configuration
+        trigger_entity_id = "binary_sensor.test_boost_trigger"
+        manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["trigger"] = (
+            trigger_entity_id
+        )
+
+        # Initial state: boost mode switch is ON
+        manager.get_entity_state_from_coordinator.side_effect = lambda key, default=None: {
+            "boost_mode": True,
+            "boost_mode_timeout": 5,
+            "boost_operation_selection": "level_4",
+        }.get(
+            key, default
+        )
+
+        # Simulate boost trigger being detected
+        manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["detected"] = ha_now()
+
+        # First update: trigger is detected, should create event
+        await manager._update_adaptive_trigger_state(CONF_BOOST_MODE_TRIGGER)
+
+        # Verify event was created
+        assert len(manager.events) == 1
+        event = manager.events[0]
+        assert event["event"] == "boost"
+        assert event["end_time"] is not None
+
+        # Verify timeout was set
+        timeout = manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["timeout"]
+        assert timeout is not None
+
+        # Now simulate that operation has changed to level_4 (boost mode is active)
+        manager.get_current_operation.return_value = "level_4"
+
+        # Simulate time passing and trigger turning OFF
+        manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["detected"] = None
+        manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["undetected"] = ha_now()
+
+        # Mock the trigger entity state as OFF
+        mock_state = MagicMock()
+        mock_state.state = STATE_OFF
+        manager._hass.states.get = MagicMock(return_value=mock_state)
+
+        # Second update: trigger is undetected, should update timeout but not clear it
+        await manager._update_adaptive_trigger_state(CONF_BOOST_MODE_TRIGGER)
+
+        # The timeout should still be set (this is where the bug was - it was being set to None)
+        timeout_after_undetect = manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER][
+            "timeout"
+        ]
+        assert (
+            timeout_after_undetect is not None
+        ), "Timeout should not be None after trigger turns off"
+
+        # Verify event still exists
+        assert len(manager.events) == 1
+
+        # Simulate time passing beyond the timeout
+        # Set the event's end_time to the past
+        manager.events[0]["end_time"] = ha_now() - timedelta(minutes=1)
+
+        # Process expired events - this should remove the boost event
+        await manager.async_process_expired_events()
+
+        # Verify the event was removed
+        assert (
+            len(manager.events) == 0
+        ), "Boost mode event should be removed after timeout"
+
+        # Verify that set_operation_selection was called twice:
+        # 1. First to activate boost mode (level_4)
+        # 2. Second to revert to week program
+        assert manager.set_operation_selection.call_count == 2
+        # The last call should be to revert to week program
+        manager.set_operation_selection.assert_called_with(STATE_WEEKPROGRAM)
+
+    @pytest.mark.asyncio
+    async def test_boost_mode_trigger_extends_timeout_when_on(self):
+        """Test that boost mode timeout is extended when trigger stays ON."""
+        manager = self.setup_mock_manager()
+
+        # Set up trigger configuration
+        trigger_entity_id = "binary_sensor.test_boost_trigger"
+        manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["trigger"] = (
+            trigger_entity_id
+        )
+
+        # Initial state: boost mode switch is ON
+        manager.get_entity_state_from_coordinator.side_effect = lambda key, default=None: {
+            "boost_mode": True,
+            "boost_mode_timeout": 5,
+            "boost_operation_selection": "level_4",
+        }.get(
+            key, default
+        )
+
+        # Simulate boost trigger being detected
+        manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["detected"] = ha_now()
+
+        # First update: trigger is detected, should create event
+        await manager._update_adaptive_trigger_state(CONF_BOOST_MODE_TRIGGER)
+
+        # Get the initial timeout
+        initial_timeout = manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["timeout"]
+        assert initial_timeout is not None
+
+        # Mock the trigger entity state as still ON
+        mock_state = MagicMock()
+        mock_state.state = STATE_ON
+        manager._hass.states.get = MagicMock(return_value=mock_state)
+
+        # Clear detected/undetected for the next update
+        manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["detected"] = None
+        manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER]["undetected"] = None
+
+        # Simulate some time passing
+        import time
+
+        time.sleep(0.1)
+
+        # Second update: trigger is still ON, should extend timeout
+        await manager._update_adaptive_trigger_state(CONF_BOOST_MODE_TRIGGER)
+
+        # The timeout should be extended (later than initial)
+        extended_timeout = manager._adaptive_triggers[CONF_BOOST_MODE_TRIGGER][
+            "timeout"
+        ]
+        assert extended_timeout is not None
+        assert extended_timeout > initial_timeout, "Timeout should be extended"
+
+        # Event should still exist
+        assert len(manager.events) == 1
